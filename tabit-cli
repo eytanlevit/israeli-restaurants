@@ -512,7 +512,8 @@ async def main_async(args: argparse.Namespace) -> int:
             org_id = matching[0]["id"]
             name = matching[0]["name"]
 
-        console.print(f"[dim]Searching {name}: {date_fmt} at {times_fmt} for {args.people} people...[/dim]\n")
+        if not args.raw:
+            console.print(f"[dim]Searching {name}: {date_fmt} at {times_fmt} for {args.people} people...[/dim]\n")
 
         async with httpx.AsyncClient() as client:
             data = await check_availability(client, org_id, args.date, args.times[0], args.people)

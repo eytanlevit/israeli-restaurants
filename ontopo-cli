@@ -900,10 +900,11 @@ def main() -> int:
                         )
                     return 1
 
-            console.print(
-                f"[dim]Searching restaurant {slug}: {date_fmt} at {time_fmt} "
-                f"for {args.people} people...[/dim]\n"
-            )
+            if not args.raw:
+                console.print(
+                    f"[dim]Searching restaurant {slug}: {date_fmt} at {time_fmt} "
+                    f"for {args.people} people...[/dim]\n"
+                )
 
             results = client.search_restaurant(slug, args.date, args.times[0], args.people)
 
@@ -930,7 +931,8 @@ def main() -> int:
             return 0
 
         # Marketplace search (all restaurants)
-        console.print(f"[dim]Searching: {date_fmt} at {time_fmt} for {args.people} people...[/dim]\n")
+        if not args.raw:
+            console.print(f"[dim]Searching: {date_fmt} at {time_fmt} for {args.people} people...[/dim]\n")
 
         results = client.search(args.date, args.times[0], args.people)
 
