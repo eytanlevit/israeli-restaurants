@@ -1,0 +1,965 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["curl_cffi>=0.7", "rich>=13.0", "requests>=2.31", "python-dotenv>=1.0"]
+# ///
+"""
+OnTopo CLI - Restaurant reservation availability search.
+
+Uses curl_cffi for browser-compatible TLS fingerprinting.
+"""
+
+import argparse
+import concurrent.futures
+import csv
+import sys
+import threading
+import time
+import uuid
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import json
+import os
+import requests as http_requests  # Avoid conflict with curl_cffi.requests
+from dotenv import load_dotenv
+
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+LOG_DIR = Path.home() / ".ontopo"
+LOG_FILE = LOG_DIR / "history.log"
+
+
+def log_search(
+    search_type: str,
+    params: dict[str, Any],
+    result_summary: str,
+) -> None:
+    """Append search to history log.
+
+    Args:
+        search_type: "restaurant: Name (slug)" or "marketplace" or "restaurant: Name"
+        params: {"date": "2026-01-15", "time": "19:00", "people": 2}
+        result_summary: "areas: 4 | available: 3" or "restaurants: 15" or "NOT FOUND"
+    """
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        parts = [
+            timestamp,
+            search_type,
+            f"date: {params.get('date', '?')}",
+            f"time: {params.get('time', '?')}",
+            f"people: {params.get('people', '?')}",
+            result_summary,
+        ]
+        line = " | ".join(parts)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        # Silently ignore logging errors - don't interrupt the user
+        pass
+
+from curl_cffi import requests
+from rich.console import Console
+from rich.table import Table
+
+
+# =============================================================================
+# API Configuration
+# =============================================================================
+
+BASE_URL = "https://ontopo.com"
+MARKETPLACE_ID = "29421469"
+MARKET_ID = "tel-aviv"
+
+HEADERS = {
+    "authority": "ontopo.com",
+    "accept": "application/json, text/plain, */*",
+    "accept-language": "en-US,en;q=0.9,he;q=0.8",
+    "origin": "https://ontopo.com",
+    "referer": f"https://ontopo.com/he/il/{MARKET_ID}",
+    # user-agent is set by curl_cffi based on impersonate profile
+}
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def is_numeric_slug(value: str) -> bool:
+    """Check if value looks like an OnTopo slug (8 digits)."""
+    return value.isdigit() and len(value) == 8
+
+
+def load_ontopo_restaurants(csv_path: Path) -> list[dict[str, str]]:
+    """Load restaurants from CSV, filter for OnTopo entries with valid slugs.
+
+    Returns list of dicts with 'name', 'slug', 'city' keys.
+    """
+    restaurants = []
+    with open(csv_path, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Support both old format (booking_service/slug) and new format (provider/id)
+            provider = row.get("provider") or row.get("booking_service", "")
+            slug = row.get("id") or row.get("slug", "")
+            if provider.lower() == "ontopo" and slug:
+                restaurants.append({
+                    "name": row.get("name", "Unknown"),
+                    "slug": slug,
+                    "city": row.get("city", ""),
+                })
+    return restaurants
+
+
+def extract_available_times(results: dict[str, Any]) -> list[str]:
+    """Extract available 'seat' times from API response.
+
+    Returns list of formatted times like ["19:00", "19:15", "20:30"].
+    """
+    times = []
+    for area in results.get("areas", []):
+        for opt in area.get("options", []):
+            if opt.get("method") == "seat":
+                raw_time = opt.get("time", "")
+                if len(raw_time) == 4:
+                    formatted = f"{raw_time[:2]}:{raw_time[2:]}"
+                    if formatted not in times:
+                        times.append(formatted)
+    # Sort times chronologically
+    times.sort()
+    return times
+
+
+# =============================================================================
+# API Client
+# =============================================================================
+
+class OnTopoClient:
+    """Client for OnTopo reservation search API."""
+
+    def __init__(self, delay: float = 0):
+        # safari15_5 impersonation provides browser-compatible TLS fingerprint
+        self.session = requests.Session(impersonate="safari15_5")
+        self.session.headers.update(HEADERS)
+        self.token: str | None = None
+        self.delay = delay
+
+    def _apply_delay(self) -> None:
+        """Apply configured delay between API calls."""
+        if self.delay > 0:
+            time.sleep(self.delay)
+
+    def authenticate(self) -> str:
+        """Step A: Get anonymous JWT token."""
+        self._apply_delay()
+        resp = self.session.post(f"{BASE_URL}/api/loginAnonymously", json={}, timeout=30)
+        resp.raise_for_status()
+
+        data = resp.json()
+        self.token = data.get("jwt_token")
+
+        if not self.token:
+            raise ValueError(f"No jwt_token in auth response: {data}")
+
+        self.session.headers["token"] = self.token
+        return self.token
+
+    def get_search_id(self, date: str, time: str, size: int) -> str:
+        """Step B: Register search criteria and get search_id."""
+        if not self.token:
+            self.authenticate()
+
+        payload = {
+            "marketplace_id": MARKETPLACE_ID,
+            "criteria": {
+                "date": date,
+                "size": str(size),  # API expects string
+                "time": time
+            },
+            "locale": "he",
+            "analytics": {
+                "market_id": MARKET_ID,
+                "origin": "direct_link",
+                "device_id": str(uuid.uuid4()),
+                "platform": "web",
+                "distributor_id": "il"
+            }
+        }
+
+        self._apply_delay()
+        resp = self.session.post(f"{BASE_URL}/api/search_token", json=payload, timeout=30)
+        resp.raise_for_status()
+
+        data = resp.json()
+        search_id = data.get("search_id")
+
+        if not search_id:
+            raise ValueError(f"No search_id in response: {data}")
+
+        return search_id
+
+    def fetch_results(self, search_id: str) -> dict[str, Any]:
+        """Step C: Fetch search results."""
+        self._apply_delay()
+        resp = self.session.post(
+            f"{BASE_URL}/api/search_request",
+            json={"search_id": search_id},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def search(self, date: str, time: str, size: int) -> dict[str, Any]:
+        """Full search flow: auth -> token -> fetch."""
+        self.authenticate()
+        search_id = self.get_search_id(date, time, size)
+        return self.fetch_results(search_id)
+
+    def search_restaurant(self, slug: str, date: str, time: str, size: int) -> dict[str, Any]:
+        """Search availability for a specific restaurant by slug."""
+        if not self.token:
+            self.authenticate()
+
+        payload = {
+            "slug": slug,
+            "locale": "he",
+            "criteria": {
+                "date": date,
+                "time": time,
+                "size": str(size)
+            },
+            "data": {
+                "analytics": {
+                    "market_id": MARKET_ID,
+                    "origin": "marketplace_post",
+                    "device_id": str(uuid.uuid4()),
+                    "platform": "web",
+                    "distributor_id": "il"
+                }
+            }
+        }
+
+        self._apply_delay()
+        resp = self.session.post(f"{BASE_URL}/api/availability_search", json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
+
+# =============================================================================
+# Perplexity Lookup
+# =============================================================================
+
+def lookup_restaurant_slug(name: str, console: Console) -> tuple[str | None, str | None]:
+    """Look up restaurant slug by name using Perplexity API.
+
+    Returns: (slug, restaurant_name) or (None, None) if not found.
+    """
+    load_dotenv()
+    api_key = os.getenv("PERPLEXITY_API_KEY")
+
+    if not api_key:
+        console.print("[red]PERPLEXITY_API_KEY not set in .env[/red]")
+        console.print("[dim]Use numeric slug directly: ontopo -r 69127207[/dim]")
+        return None, None
+
+    console.print(f"[dim]Looking up \"{name}\"...[/dim]")
+
+    prompt = f"""Find the ontopo.com reservation page for "{name}" restaurant in Israel.
+
+RULES:
+1. Return EXACTLY ONE result - your best match
+2. IMPORTANT: Pick the MAIN DINING RESTAURANT, not a cafe, salon, bar, or event space
+3. If a restaurant group has multiple concepts, pick the flagship fine dining location
+4. If multiple cities, pick the most famous location (usually Tel Aviv)
+5. If you can't find an ontopo.com page, return found: false
+
+Return JSON only:
+{{
+  "found": true,
+  "name": "Full restaurant name",
+  "slug": "NUMERIC_ID",
+  "city": "City name"
+}}
+
+Or if not found:
+{{
+  "found": false
+}}"""
+
+    try:
+        response = http_requests.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "sonar",
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+
+        content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+
+        # Parse JSON from response
+        data = _parse_json_response(content)
+
+        if data and data.get("found"):
+            slug = data.get("slug")
+            # Validate slug format (should be 6-10 digits)
+            if not slug or not (slug.isdigit() and 6 <= len(slug) <= 10):
+                console.print(f"[yellow]Invalid slug format returned: {slug}[/yellow]")
+                return None, None
+            found_name = data.get("name", name)
+            city = data.get("city", "")
+            console.print(f"[green]Found: {found_name} ({city}) → slug: {slug}[/green]")
+            return slug, found_name
+        else:
+            console.print(f"[yellow]Restaurant \"{name}\" not found on OnTopo[/yellow]")
+            console.print("[dim]Tips:[/dim]")
+            console.print("[dim]  • Check spelling or try a different name variation[/dim]")
+            console.print("[dim]  • Use the restaurant's Hebrew name if known[/dim]")
+            console.print("[dim]  • Find the slug manually at ontopo.com and use: -r SLUG[/dim]")
+            return None, None
+
+    except http_requests.exceptions.Timeout:
+        console.print("[red]Lookup timed out. Try using numeric slug directly.[/red]")
+        return None, None
+    except http_requests.exceptions.RequestException as e:
+        console.print(f"[red]Lookup failed: {e}[/red]")
+        return None, None
+
+
+def _parse_json_response(content: str) -> dict | None:
+    """Parse JSON from Perplexity response, handling markdown code blocks."""
+    # Extract from markdown code block if present
+    if "```json" in content:
+        start = content.find("```json") + 7
+        end = content.find("```", start)
+        if end > start:
+            content = content[start:end].strip()
+    elif "```" in content:
+        start = content.find("```") + 3
+        end = content.find("```", start)
+        if end > start:
+            content = content[start:end].strip()
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        # Try to find JSON object in content
+        start = content.find("{")
+        end = content.rfind("}") + 1
+        if start >= 0 and end > start:
+            try:
+                return json.loads(content[start:end])
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
+# =============================================================================
+# Output Formatting
+# =============================================================================
+
+def format_results(data: dict[str, Any], console: Console) -> None:
+    """Display marketplace search results."""
+    posts = data.get("posts", [])
+
+    if not posts:
+        console.print("[yellow]No restaurants found.[/yellow]")
+        return
+
+    table = Table(title="Available Reservations", show_lines=True)
+    table.add_column("Restaurant", style="cyan", no_wrap=True)
+    table.add_column("Area", style="dim")
+    table.add_column("Status", style="bold")
+    table.add_column("Slots", style="green")
+
+    for entry in posts:
+        post = entry.get("post", {})
+        availability = entry.get("availability", {})
+        name = post.get("venue_name", "Unknown")
+
+        areas = availability.get("areas", [])
+        if not areas:
+            table.add_row(name, "-", "[dim]No areas[/dim]", "-")
+            continue
+
+        first_row = True
+        for area in areas:
+            area_name = area.get("name", "-")
+            options = area.get("options", [])
+
+            # Separate available (seat) and standby options
+            seat_opts = [opt for opt in options if opt.get("method") == "seat"]
+            standby_opts = [opt for opt in options if opt.get("method") == "standby"]
+
+            def format_times(opts: list, max_show: int = 5) -> str:
+                if not opts:
+                    return "-"
+                times = [opt.get("time", "") for opt in opts[:max_show]]
+                times_fmt = [f"{t[:2]}:{t[2:]}" for t in times if len(t) == 4]
+                result = ", ".join(times_fmt)
+                if len(opts) > max_show:
+                    result += f" (+{len(opts) - max_show})"
+                return result
+
+            display_name = name if first_row else ""
+
+            if seat_opts:
+                table.add_row(
+                    display_name,
+                    area_name,
+                    "[green]Available[/green]",
+                    format_times(seat_opts),
+                )
+                display_name = ""
+                area_name = ""
+                first_row = False
+
+            if standby_opts:
+                table.add_row(
+                    display_name,
+                    area_name,
+                    "[yellow]Standby[/yellow]",
+                    f"[yellow]{format_times(standby_opts)}[/yellow]",
+                )
+                display_name = ""
+                first_row = False
+
+            # If neither, show as full
+            if not seat_opts and not standby_opts:
+                table.add_row(display_name, area_name, "[red]Full[/red]", "-")
+                first_row = False
+
+    console.print(table)
+    console.print(f"\n[dim]Total: {len(posts)} restaurants | Standby = waitlist (not guaranteed)[/dim]")
+
+
+def format_restaurant_result(data: dict[str, Any], slug: str, console: Console, name: str | None = None) -> None:
+    """Display single restaurant availability."""
+    title = name if name else f"Restaurant {slug}"
+    table = Table(title=f"Availability: {title}", show_lines=True)
+    table.add_column("Area", style="dim")
+    table.add_column("Status", style="bold")
+    table.add_column("Slots", style="green")
+
+    areas = data.get("areas", [])
+    if not areas:
+        table.add_row("-", "[dim]No areas[/dim]", "-")
+    else:
+        for area in areas:
+            area_name = area.get("name", "-")
+            options = area.get("options", [])
+
+            # Separate available (seat) and standby options
+            seat_opts = [opt for opt in options if opt.get("method") == "seat"]
+            standby_opts = [opt for opt in options if opt.get("method") == "standby"]
+
+            def format_times(opts: list, max_show: int = 8) -> str:
+                if not opts:
+                    return "-"
+                times = [opt.get("time", "") for opt in opts[:max_show]]
+                times_fmt = [f"{t[:2]}:{t[2:]}" for t in times if len(t) == 4]
+                result = ", ".join(times_fmt)
+                if len(opts) > max_show:
+                    result += f" (+{len(opts) - max_show})"
+                return result
+
+            # Add rows for this area
+            if seat_opts:
+                table.add_row(
+                    area_name,
+                    "[green]Available[/green]",
+                    format_times(seat_opts),
+                )
+                # Clear area name for subsequent rows in same area
+                area_name = ""
+
+            if standby_opts:
+                table.add_row(
+                    area_name,
+                    "[yellow]Standby[/yellow]",
+                    f"[yellow]{format_times(standby_opts)}[/yellow]",
+                )
+                area_name = ""
+
+            # If neither, show as full
+            if not seat_opts and not standby_opts:
+                table.add_row(area_name, "[red]Full[/red]", "-")
+
+    console.print(table)
+    console.print("[dim]Standby = waitlist (not guaranteed)[/dim]")
+
+
+# =============================================================================
+# Batch Processing
+# =============================================================================
+
+def _check_single_restaurant(
+    client: OnTopoClient,
+    restaurant: dict[str, str],
+    date: str,
+    times: list[str],
+    size: int,
+    delay: float,
+    raw: bool,
+) -> dict[str, Any]:
+    """Check availability for a single restaurant (used by parallel executor).
+
+    Args:
+        client: Authenticated OnTopoClient
+        restaurant: Dict with 'name', 'slug' keys
+        date: Date in YYYYMMDD format
+        times: List of times in HHMM format to check
+        size: Party size
+        delay: Delay between requests in seconds
+        raw: If True, include raw JSON responses
+
+    Returns:
+        Result dict with 'name', 'slug', 'available_times', and optionally 'responses'
+    """
+    name = restaurant["name"]
+    slug = restaurant["slug"]
+    all_available = set()
+    responses = [] if raw else None
+    error = None
+
+    for i, check_time in enumerate(times):
+        try:
+            response = client.search_restaurant(slug, date, check_time, size)
+            if raw:
+                responses.append({"time": check_time, "data": response})
+            available = extract_available_times(response)
+            all_available.update(available)
+
+            # Apply delay between time checks within this restaurant
+            if delay > 0 and i < len(times) - 1:
+                time.sleep(delay)
+
+        except Exception as e:
+            error = str(e)
+            break
+
+    result = {
+        "name": name,
+        "slug": slug,
+        "available_times": sorted(list(all_available)),
+        "error": error,
+    }
+    if raw:
+        result["responses"] = responses
+    return result
+
+
+def run_batch_check(
+    client: OnTopoClient,
+    restaurants: list[dict[str, str]],
+    date: str,
+    times: list[str],
+    size: int,
+    delay: float,
+    console: Console,
+    raw: bool = False,
+    workers: int = 5,
+) -> list[dict[str, Any]]:
+    """Run batch availability check across all restaurants.
+
+    Args:
+        client: Authenticated OnTopoClient
+        restaurants: List of restaurant dicts with 'name', 'slug' keys
+        date: Date in YYYYMMDD format
+        times: List of times in HHMM format to check
+        size: Party size
+        delay: Delay between requests in seconds
+        console: Rich console for output
+        raw: If True, collect raw JSON responses
+        workers: Number of parallel workers (1 = sequential)
+
+    Returns:
+        List of results with restaurant info and available times
+    """
+    total = len(restaurants)
+    results = []
+    progress_counter = [0]  # Use list for mutable counter in closure
+    counter_lock = threading.Lock()
+
+    def process_restaurant(restaurant: dict[str, str]) -> dict[str, Any]:
+        """Process a single restaurant and print progress."""
+        result = _check_single_restaurant(
+            client, restaurant, date, times, size, delay, raw
+        )
+
+        # Thread-safe progress counter
+        with counter_lock:
+            progress_counter[0] += 1
+            progress_num = progress_counter[0]
+
+        # Print progress (Rich console is thread-safe)
+        name = result["name"]
+        if result.get("error"):
+            console.print(f"({progress_num}/{total}) {name}... [red]error: {result['error']}[/red]")
+        elif result["available_times"]:
+            times_str = ", ".join(result["available_times"])
+            console.print(f"({progress_num}/{total}) {name}... [green]{times_str}[/green]")
+        else:
+            console.print(f"({progress_num}/{total}) {name}... [dim]no availability[/dim]")
+
+        return result
+
+    if workers == 1:
+        # Sequential mode (old behavior)
+        for restaurant in restaurants:
+            result = process_restaurant(restaurant)
+            results.append(result)
+            # Apply delay between restaurants in sequential mode
+            if delay > 0 and progress_counter[0] < total:
+                time.sleep(delay)
+    else:
+        # Parallel mode using ThreadPoolExecutor
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            # Submit all tasks
+            future_to_restaurant = {
+                executor.submit(process_restaurant, r): r for r in restaurants
+            }
+
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_restaurant):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    restaurant = future_to_restaurant[future]
+                    console.print(f"[red]Unexpected error for {restaurant['name']}: {e}[/red]")
+                    results.append({
+                        "name": restaurant["name"],
+                        "slug": restaurant["slug"],
+                        "available_times": [],
+                        "error": str(e),
+                    })
+
+    # Remove error key from results before returning (for backward compatibility)
+    for r in results:
+        r.pop("error", None)
+
+    if raw:
+        return [r for r in results if "responses" in r]
+    return results
+
+
+def format_batch_results(
+    results: list[dict[str, Any]],
+    date: str,
+    size: int,
+    console: Console,
+) -> None:
+    """Display batch results in a summary table.
+
+    Args:
+        results: List of result dicts with 'name', 'slug', 'available_times'
+        date: Date string for display
+        size: Party size for display
+        console: Rich console for output
+    """
+    # Filter to only restaurants with availability
+    available = [r for r in results if r.get("available_times")]
+
+    if not available:
+        console.print("\n[yellow]No availability found at any restaurant.[/yellow]")
+        return
+
+    table = Table(title="Restaurants with Availability", show_lines=True)
+    table.add_column("Restaurant", style="cyan", no_wrap=True)
+    table.add_column("Available Times", style="green")
+    table.add_column("Book", style="dim")
+
+    for r in available:
+        name = r["name"]
+        times_str = ", ".join(r["available_times"])
+        book_url = f"ontopo.com/he/il/r/{r['slug']}"
+        table.add_row(name, times_str, book_url)
+
+    console.print()
+    console.print(table)
+    console.print(f"\n[bold]Total: {len(available)} restaurants with availability[/bold]")
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def get_tomorrow() -> str:
+    """Return tomorrow's date in YYYYMMDD format."""
+    return (datetime.now() + timedelta(days=1)).strftime("%Y%m%d")
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Search OnTopo for restaurant reservations",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                          # Tomorrow, 19:00, 2 people
+  %(prog)s --date 20250120          # Specific date
+  %(prog)s --time 2030 --people 4   # 20:30, 4 people
+  %(prog)s --restaurant "Shila"     # Search by restaurant name
+  %(prog)s --restaurant 88698605    # Specific restaurant by slug
+  %(prog)s --raw                    # Output raw JSON
+
+Batch mode:
+  %(prog)s --batch -d 20260127 -t 1900              # Check all restaurants (5 workers)
+  %(prog)s --batch -d 20260127 -t 1900 --workers 10 # Faster with 10 workers
+  %(prog)s --batch -d 20260127 -t 1900 --workers 1  # Sequential (old behavior)
+  %(prog)s --batch -d 20260127 -t 1900 -t 2100      # Multiple times
+  %(prog)s --batch -d 20260127 -t 1900,2045,2100    # Comma-separated times
+        """
+    )
+
+    parser.add_argument(
+        "--date", "-d",
+        default=get_tomorrow(),
+        help="Date in YYYYMMDD format (default: tomorrow)"
+    )
+    parser.add_argument(
+        "--time", "-t",
+        action="append",
+        dest="times",
+        help="Time in HHMM format, repeatable (default: 1900). Use -t 1900 -t 2100 or -t 1900,2100"
+    )
+    parser.add_argument(
+        "--people", "-p",
+        type=int,
+        default=2,
+        help="Party size (default: 2)"
+    )
+    parser.add_argument(
+        "--restaurant", "-r",
+        help="Restaurant name or slug (8-digit ID)"
+    )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Output raw JSON instead of formatted table"
+    )
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Disable logging this search to ~/.ontopo/history.log"
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.3,
+        help="Delay in seconds between API calls (default: 0.3)"
+    )
+    parser.add_argument(
+        "--batch", "-b",
+        action="store_true",
+        help="Batch mode: check all restaurants in CSV"
+    )
+    parser.add_argument(
+        "--csv",
+        type=Path,
+        help="Custom path to restaurants CSV (default: restaurants.csv in script dir)"
+    )
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=5,
+        help="Number of parallel workers for batch mode (default: 5, use 1 for sequential)"
+    )
+
+    args = parser.parse_args()
+
+    # Handle times: default to ["1900"], expand comma-separated values
+    if args.times is None:
+        args.times = ["1900"]
+    else:
+        # Expand comma-separated times
+        expanded = []
+        for t in args.times:
+            expanded.extend(t.split(","))
+        args.times = expanded
+
+    return args
+
+
+def main() -> int:
+    """Main entry point."""
+    args = parse_args()
+    console = Console()
+
+    # Validate date format
+    try:
+        datetime.strptime(args.date, "%Y%m%d")
+    except ValueError:
+        console.print(f"[red]Invalid date format: {args.date}. Use YYYYMMDD.[/red]")
+        return 1
+
+    # Validate time format(s)
+    for t in args.times:
+        if not (len(t) == 4 and t.isdigit()):
+            console.print(f"[red]Invalid time format: {t}. Use HHMM.[/red]")
+            return 1
+
+    date_fmt = datetime.strptime(args.date, "%Y%m%d").strftime("%Y-%m-%d")
+    # For backward compat and logging, use first time
+    time_fmt = f"{args.times[0][:2]}:{args.times[0][2:]}"
+    times_fmt = ", ".join(f"{t[:2]}:{t[2:]}" for t in args.times)
+
+    try:
+        # Batch mode: check all restaurants from CSV
+        if args.batch:
+            # Determine CSV path
+            if args.csv:
+                csv_path = args.csv
+            else:
+                # Default: restaurants.csv in same directory as script
+                script_dir = Path(__file__).parent.resolve()
+                csv_path = script_dir / "restaurants.csv"
+
+            if not csv_path.exists():
+                console.print(f"[red]CSV file not found: {csv_path}[/red]")
+                return 1
+
+            try:
+                restaurants = load_ontopo_restaurants(csv_path)
+            except Exception as e:
+                console.print(f"[red]Error loading CSV: {e}[/red]")
+                return 1
+
+            if not restaurants:
+                console.print("[yellow]No OnTopo restaurants found in CSV.[/yellow]")
+                return 1
+
+            workers = max(1, args.workers)  # Ensure at least 1 worker
+            console.print(f"[bold]Batch check: {len(restaurants)} restaurants[/bold]")
+            console.print(f"Date: {date_fmt} | Times: {times_fmt} | People: {args.people} | Workers: {workers}\n")
+
+            # Use delay for batch mode (default 0.3s for sequential, 0 for parallel)
+            delay = args.delay if workers == 1 else 0
+            client = OnTopoClient(delay=0)  # We handle delay in batch loop
+            client.authenticate()
+
+            results = run_batch_check(
+                client=client,
+                restaurants=restaurants,
+                date=args.date,
+                times=args.times,
+                size=args.people,
+                delay=delay,
+                console=console,
+                raw=args.raw,
+                workers=workers,
+            )
+
+            if args.raw:
+                console.print_json(json.dumps(results, ensure_ascii=False))
+            else:
+                format_batch_results(results, date_fmt, args.people, console)
+
+            # Log batch search
+            if not args.no_log:
+                available_count = sum(1 for r in results if r.get("available_times"))
+                log_search(
+                    "batch",
+                    {"date": date_fmt, "time": times_fmt, "people": args.people},
+                    f"checked: {len(restaurants)} | available: {available_count}",
+                )
+
+            return 0
+
+        client = OnTopoClient(delay=args.delay)
+
+        # Single restaurant search
+        if args.restaurant:
+            raw_input = args.restaurant.strip()
+
+            if is_numeric_slug(raw_input):
+                slug = raw_input
+                restaurant_name = None
+            else:
+                slug, restaurant_name = lookup_restaurant_slug(raw_input, console)
+                if slug is None:
+                    # Log not-found
+                    if not args.no_log:
+                        log_search(
+                            f"restaurant: {raw_input}",
+                            {"date": date_fmt, "time": time_fmt, "people": args.people},
+                            "NOT FOUND",
+                        )
+                    return 1
+
+            console.print(
+                f"[dim]Searching restaurant {slug}: {date_fmt} at {time_fmt} "
+                f"for {args.people} people...[/dim]\n"
+            )
+
+            results = client.search_restaurant(slug, args.date, args.times[0], args.people)
+
+            if args.raw:
+                console.print_json(json.dumps(results, ensure_ascii=False))
+            else:
+                format_restaurant_result(results, slug, console, restaurant_name)
+
+            # Log successful restaurant search
+            if not args.no_log:
+                areas = results.get("areas", [])
+                available_count = sum(
+                    1 for area in areas
+                    for opt in area.get("options", [])
+                    if opt.get("method") in ("seat", "standby")
+                )
+                display_name = restaurant_name if restaurant_name else slug
+                log_search(
+                    f"restaurant: {display_name} ({slug})",
+                    {"date": date_fmt, "time": time_fmt, "people": args.people},
+                    f"areas: {len(areas)} | available: {available_count}",
+                )
+
+            return 0
+
+        # Marketplace search (all restaurants)
+        console.print(f"[dim]Searching: {date_fmt} at {time_fmt} for {args.people} people...[/dim]\n")
+
+        results = client.search(args.date, args.times[0], args.people)
+
+        if args.raw:
+            console.print_json(json.dumps(results, ensure_ascii=False))
+        else:
+            format_results(results, console)
+
+        # Log successful marketplace search
+        if not args.no_log:
+            posts = results.get("posts", [])
+            log_search(
+                "marketplace",
+                {"date": date_fmt, "time": time_fmt, "people": args.people},
+                f"restaurants: {len(posts)}",
+            )
+
+        return 0
+
+    except requests.RequestsError as e:
+        console.print(f"[red]HTTP Error: {e}[/red]")
+        return 1
+    except ValueError as e:
+        console.print(f"[red]API Error: {e}[/red]")
+        return 1
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Cancelled.[/yellow]")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

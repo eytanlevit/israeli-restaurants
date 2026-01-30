@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""
+Tabit CLI - Restaurant reservation availability search.
+
+Standardized interface matching ontopo-cli:
+- Date: YYYYMMDD
+- Time: HHMM
+- Supports --raw, --batch, -r
+
+Dependencies (inline for uv):
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["httpx>=0.27", "rich>=13.0"]
+# ///
+"""
+import argparse
+import asyncio
+import csv
+import json
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import httpx
+from rich.console import Console
+from rich.table import Table
+
+# Timezone constants
+ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
+UTC_TZ = ZoneInfo("UTC")
+
+
+# =============================================================================
+# CSV Loading
+# =============================================================================
+
+def load_tabit_restaurants(csv_path: Path) -> list[dict[str, str]]:
+    """Load restaurants from CSV, filter for Tabit entries.
+
+    Returns list of dicts with 'name', 'id', 'city' keys.
+    """
+    restaurants = []
+    with open(csv_path, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("provider") == "tabit" and row.get("id"):
+                restaurants.append({
+                    "name": row.get("name", "Unknown"),
+                    "id": row["id"],
+                    "city": row.get("city", ""),
+                })
+    return restaurants
+
+
+# =============================================================================
+# Time Conversion
+# =============================================================================
+
+def israel_to_utc(date_str: str, time_str: str) -> str:
+    """Convert Israel local date/time to UTC ISO string for API.
+
+    Args:
+        date_str: Date in YYYYMMDD format
+        time_str: Time in HHMM format (Israel local time)
+
+    Returns:
+        UTC ISO string for API (e.g., "2026-01-30T17:00:00.000Z")
+    """
+    # Parse YYYYMMDD and HHMM formats
+    date_parsed = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
+    time_parsed = f"{time_str[:2]}:{time_str[2:]}"
+
+    israel_dt = datetime.fromisoformat(f"{date_parsed}T{time_parsed}:00")
+    israel_dt = israel_dt.replace(tzinfo=ISRAEL_TZ)
+    utc_dt = israel_dt.astimezone(UTC_TZ)
+    return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def utc_to_israel_time(utc_time_str: str) -> str:
+    """Convert UTC time string from API to Israel local time (HH:MM).
+
+    Args:
+        utc_time_str: ISO format time string from API
+
+    Returns:
+        Time string in HH:MM format (Israel local time)
+    """
+    utc_time_str = utc_time_str.replace("Z", "+00:00")
+    utc_dt = datetime.fromisoformat(utc_time_str)
+    if utc_dt.tzinfo is None:
+        utc_dt = utc_dt.replace(tzinfo=UTC_TZ)
+    israel_dt = utc_dt.astimezone(ISRAEL_TZ)
+    return israel_dt.strftime("%H:%M")
+
+
+# =============================================================================
+# API Client
+# =============================================================================
+
+async def check_availability(
+    client: httpx.AsyncClient,
+    org_id: str,
+    date_str: str,
+    time_str: str,
+    party_size: int,
+) -> dict:
+    """Check availability for a restaurant.
+
+    Args:
+        client: httpx AsyncClient
+        org_id: Tabit organization ID
+        date_str: Date in YYYYMMDD format
+        time_str: Time in HHMM format (Israel local time)
+        party_size: Number of guests
+
+    Returns:
+        API response dict
+    """
+    url = "https://tgm-api.tabit.cloud/rsv/booking/temp-reservations"
+    utc_time_str = israel_to_utc(date_str, time_str)
+
+    payload = {
+        "organization": org_id,
+        "type": "future_reservation",
+        "standby_reservation": False,
+        "seats_count": party_size,
+        "preference": "inside",
+        "arriving_within": None,
+        "reserved_from": utc_time_str,
+        "modified_reservation_id": "",
+        "online_booking_source": "tabit",
+        "online_booking_source_client": {"name": "tabit-web", "environment": "il-prod"},
+    }
+
+    try:
+        resp = await client.post(url, json=payload, timeout=10)
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def extract_available_times(data: dict) -> list[str]:
+    """Extract available times from API response.
+
+    Returns list of times in HH:MM format (Israel time).
+    """
+    times = []
+
+    if "error" in data:
+        return times
+
+    if "alternative_results" in data:
+        for alt in data.get("alternative_results", []):
+            slots_data = alt.get("time_slots", [])
+            if isinstance(slots_data, list) and slots_data:
+                if isinstance(slots_data[0], dict):
+                    # Structured by area
+                    for area in slots_data:
+                        for t in area.get("time_slots", []):
+                            time_str = utc_to_israel_time(t)
+                            if time_str not in times:
+                                times.append(time_str)
+                else:
+                    # Flat list of times
+                    for t in slots_data:
+                        time_str = utc_to_israel_time(t)
+                        if time_str not in times:
+                            times.append(time_str)
+    elif "id" in data:
+        # Direct slot available - use requested time
+        times.append("SLOT_AVAILABLE")
+
+    times.sort()
+    return times
+
+
+# =============================================================================
+# Output Formatting
+# =============================================================================
+
+def format_restaurant_result(
+    data: dict,
+    name: str,
+    date_str: str,
+    time_str: str,
+    party_size: int,
+    console: Console,
+) -> None:
+    """Display single restaurant availability."""
+    date_fmt = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
+    time_fmt = f"{time_str[:2]}:{time_str[2:]}"
+
+    table = Table(title=f"Availability: {name}", show_lines=True)
+    table.add_column("Area", style="dim")
+    table.add_column("Status", style="bold")
+    table.add_column("Slots", style="green")
+
+    if "error" in data:
+        table.add_row("-", f"[red]Error: {data['error']}[/red]", "-")
+    elif "alternative_results" in data:
+        for alt in data.get("alternative_results", []):
+            slots_data = alt.get("time_slots", [])
+            if isinstance(slots_data, list) and slots_data:
+                if isinstance(slots_data[0], dict):
+                    for area in slots_data:
+                        area_name = area.get("name", "unknown")
+                        times = [utc_to_israel_time(t) for t in area.get("time_slots", [])[:8]]
+                        if times:
+                            table.add_row(area_name, "[green]Available[/green]", ", ".join(times))
+                        else:
+                            table.add_row(area_name, "[red]Full[/red]", "-")
+                else:
+                    times = [utc_to_israel_time(t) for t in slots_data[:8]]
+                    table.add_row("-", "[green]Available[/green]", ", ".join(times))
+    elif "id" in data:
+        table.add_row("-", "[green]SLOT AVAILABLE[/green]", time_fmt)
+    else:
+        desc = data.get("description_string", str(data)[:80])
+        table.add_row("-", f"[yellow]{desc}[/yellow]", "-")
+
+    console.print(table)
+    console.print(f"[dim]Date: {date_fmt} | Time: {time_fmt} | Party: {party_size}[/dim]")
+
+
+def format_batch_results(
+    results: list[dict],
+    date_str: str,
+    party_size: int,
+    console: Console,
+) -> None:
+    """Display batch results in a summary table."""
+    date_fmt = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
+
+    available = [r for r in results if r.get("available_times")]
+
+    if not available:
+        console.print("\n[yellow]No availability found at any restaurant.[/yellow]")
+        return
+
+    table = Table(title="Restaurants with Availability", show_lines=True)
+    table.add_column("Restaurant", style="cyan", no_wrap=True)
+    table.add_column("Available Times", style="green")
+    table.add_column("Book", style="dim")
+
+    for r in available:
+        name = r["name"]
+        times_str = ", ".join(r["available_times"])
+        book_url = f"tabitisrael.co.il/he/rsv/area/{r['id']}"
+        table.add_row(name, times_str, book_url)
+
+    console.print()
+    console.print(table)
+    console.print(f"\n[bold]Total: {len(available)} restaurants with availability[/bold]")
+
+
+# =============================================================================
+# Batch Processing
+# =============================================================================
+
+async def run_batch_check(
+    restaurants: list[dict],
+    date_str: str,
+    times: list[str],
+    party_size: int,
+    console: Console,
+    raw: bool = False,
+) -> list[dict]:
+    """Run batch availability check across all restaurants.
+
+    Args:
+        restaurants: List of restaurant dicts with 'name', 'id' keys
+        date_str: Date in YYYYMMDD format
+        times: List of times in HHMM format to check
+        party_size: Party size
+        console: Rich console for output
+        raw: If True, collect raw JSON responses
+
+    Returns:
+        List of results with restaurant info and available times
+    """
+    results = []
+    total = len(restaurants)
+
+    async with httpx.AsyncClient() as client:
+        for i, restaurant in enumerate(restaurants, 1):
+            name = restaurant["name"]
+            org_id = restaurant["id"]
+            all_times = set()
+            responses = [] if raw else None
+            error = None
+
+            for check_time in times:
+                data = await check_availability(client, org_id, date_str, check_time, party_size)
+
+                if raw:
+                    responses.append({"time": check_time, "data": data})
+
+                if "error" in data:
+                    error = data["error"]
+                    break
+
+                available = extract_available_times(data)
+                all_times.update(available)
+
+            # Print progress
+            if error:
+                console.print(f"({i}/{total}) {name}... [red]error: {error}[/red]")
+            elif all_times:
+                times_str = ", ".join(sorted(all_times))
+                console.print(f"({i}/{total}) {name}... [green]{times_str}[/green]")
+            else:
+                console.print(f"({i}/{total}) {name}... [dim]no availability[/dim]")
+
+            result = {
+                "name": name,
+                "id": org_id,
+                "available_times": sorted(list(all_times)),
+            }
+            if raw:
+                result["responses"] = responses
+            results.append(result)
+
+    return results
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def get_tomorrow() -> str:
+    """Return tomorrow's date in YYYYMMDD format."""
+    now = datetime.now(ISRAEL_TZ)
+    return (now + timedelta(days=1)).strftime("%Y%m%d")
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Search Tabit for restaurant reservations",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                          # Tomorrow, 19:00, 2 people
+  %(prog)s --date 20250120          # Specific date
+  %(prog)s --time 2030 --people 4   # 20:30, 4 people
+  %(prog)s --restaurant "DOK"       # Search by restaurant name
+  %(prog)s --restaurant 60ab7a96... # Specific restaurant by ID
+  %(prog)s --raw                    # Output raw JSON
+
+Batch mode:
+  %(prog)s --batch -d 20260127 -t 1900              # Check all restaurants
+  %(prog)s --batch -d 20260127 -t 1900 -t 2100      # Multiple times
+  %(prog)s --batch -d 20260127 -t 1900,2045,2100    # Comma-separated times
+        """
+    )
+
+    parser.add_argument(
+        "--date", "-d",
+        default=get_tomorrow(),
+        help="Date in YYYYMMDD format (default: tomorrow)"
+    )
+    parser.add_argument(
+        "--time", "-t",
+        action="append",
+        dest="times",
+        help="Time in HHMM format, repeatable (default: 1900). Use -t 1900 -t 2100 or -t 1900,2100"
+    )
+    parser.add_argument(
+        "--people", "-p",
+        type=int,
+        default=2,
+        help="Party size (default: 2)"
+    )
+    parser.add_argument(
+        "--restaurant", "-r",
+        help="Restaurant name or Tabit org ID"
+    )
+    parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Output raw JSON instead of formatted table"
+    )
+    parser.add_argument(
+        "--batch", "-b",
+        action="store_true",
+        help="Batch mode: check all Tabit restaurants in CSV"
+    )
+    parser.add_argument(
+        "--csv",
+        type=Path,
+        help="Custom path to restaurants CSV (default: restaurants.csv in script dir)"
+    )
+    parser.add_argument(
+        "--list", "-l",
+        action="store_true",
+        help="List restaurants from CSV and exit"
+    )
+
+    args = parser.parse_args()
+
+    # Handle times: default to ["1900"], expand comma-separated values
+    if args.times is None:
+        args.times = ["1900"]
+    else:
+        expanded = []
+        for t in args.times:
+            expanded.extend(t.split(","))
+        args.times = expanded
+
+    return args
+
+
+async def main_async(args: argparse.Namespace) -> int:
+    """Main async entry point."""
+    console = Console()
+
+    # Determine CSV path
+    if args.csv:
+        csv_path = args.csv
+    else:
+        script_dir = Path(__file__).parent.resolve()
+        csv_path = script_dir / "restaurants.csv"
+
+    # Validate date format
+    try:
+        datetime.strptime(args.date, "%Y%m%d")
+    except ValueError:
+        console.print(f"[red]Invalid date format: {args.date}. Use YYYYMMDD.[/red]")
+        return 1
+
+    # Validate time format(s)
+    for t in args.times:
+        if not (len(t) == 4 and t.isdigit()):
+            console.print(f"[red]Invalid time format: {t}. Use HHMM.[/red]")
+            return 1
+
+    date_fmt = datetime.strptime(args.date, "%Y%m%d").strftime("%Y-%m-%d")
+    times_fmt = ", ".join(f"{t[:2]}:{t[2:]}" for t in args.times)
+
+    # List mode
+    if args.list:
+        if not csv_path.exists():
+            console.print(f"[red]CSV file not found: {csv_path}[/red]")
+            return 1
+        restaurants = load_tabit_restaurants(csv_path)
+        console.print("Tabit restaurants in CSV:")
+        console.print("-" * 40)
+        for r in restaurants:
+            console.print(f"  {r['name']} ({r['city']})")
+        return 0
+
+    # Batch mode
+    if args.batch:
+        if not csv_path.exists():
+            console.print(f"[red]CSV file not found: {csv_path}[/red]")
+            return 1
+
+        restaurants = load_tabit_restaurants(csv_path)
+        if not restaurants:
+            console.print("[yellow]No Tabit restaurants found in CSV.[/yellow]")
+            return 1
+
+        console.print(f"[bold]Batch check: {len(restaurants)} restaurants[/bold]")
+        console.print(f"Date: {date_fmt} | Times: {times_fmt} | People: {args.people}\n")
+
+        results = await run_batch_check(
+            restaurants=restaurants,
+            date_str=args.date,
+            times=args.times,
+            party_size=args.people,
+            console=console,
+            raw=args.raw,
+        )
+
+        if args.raw:
+            console.print_json(json.dumps(results, ensure_ascii=False))
+        else:
+            format_batch_results(results, args.date, args.people, console)
+
+        return 0
+
+    # Single restaurant search
+    if args.restaurant:
+        raw_input = args.restaurant.strip()
+
+        # Check if it's a Tabit org ID (24 hex characters)
+        if len(raw_input) == 24 and all(c in '0123456789abcdef' for c in raw_input):
+            org_id = raw_input
+            name = f"Restaurant {org_id[:8]}..."
+        else:
+            # Look up by name in CSV
+            if not csv_path.exists():
+                console.print(f"[red]CSV file not found: {csv_path}[/red]")
+                return 1
+
+            restaurants = load_tabit_restaurants(csv_path)
+            matching = [r for r in restaurants if raw_input.lower() in r["name"].lower()]
+
+            if not matching:
+                console.print(f"[red]No Tabit restaurant matching '{raw_input}'[/red]")
+                console.print("[dim]Use --list to see available restaurants.[/dim]")
+                return 1
+
+            if len(matching) > 1:
+                console.print(f"[yellow]Multiple matches for '{raw_input}':[/yellow]")
+                for r in matching:
+                    console.print(f"  {r['name']}")
+                console.print("[dim]Please be more specific.[/dim]")
+                return 1
+
+            org_id = matching[0]["id"]
+            name = matching[0]["name"]
+
+        console.print(f"[dim]Searching {name}: {date_fmt} at {times_fmt} for {args.people} people...[/dim]\n")
+
+        async with httpx.AsyncClient() as client:
+            data = await check_availability(client, org_id, args.date, args.times[0], args.people)
+
+        if args.raw:
+            console.print_json(json.dumps(data, ensure_ascii=False))
+        else:
+            format_restaurant_result(data, name, args.date, args.times[0], args.people, console)
+
+        return 0
+
+    # No restaurant specified and not batch mode - error
+    console.print("[red]Please specify --restaurant NAME or use --batch mode[/red]")
+    console.print("[dim]Use --help for usage information.[/dim]")
+    return 1
+
+
+def main() -> int:
+    """Main entry point."""
+    args = parse_args()
+    return asyncio.run(main_async(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
