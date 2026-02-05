@@ -94,6 +94,23 @@ def utc_to_israel_time(utc_time_str: str) -> str:
     return israel_dt.strftime("%H:%M")
 
 
+def utc_to_israel_date(utc_time_str: str) -> str:
+    """Convert UTC time string from API to Israel local date (Mon 2/5).
+
+    Args:
+        utc_time_str: ISO format time string from API
+
+    Returns:
+        Date string in "Mon 2/5" format (Israel local time)
+    """
+    utc_time_str = utc_time_str.replace("Z", "+00:00")
+    utc_dt = datetime.fromisoformat(utc_time_str)
+    if utc_dt.tzinfo is None:
+        utc_dt = utc_dt.replace(tzinfo=UTC_TZ)
+    israel_dt = utc_dt.astimezone(ISRAEL_TZ)
+    return israel_dt.strftime("%a %-m/%-d")
+
+
 # =============================================================================
 # API Client
 # =============================================================================
@@ -144,6 +161,7 @@ def extract_available_times(data: dict) -> list[str]:
     """Extract available times from API response.
 
     Returns list of times in HH:MM format (Israel time).
+    Only includes times from the requested day (requested_day_result=True).
     """
     times = []
 
@@ -152,6 +170,9 @@ def extract_available_times(data: dict) -> list[str]:
 
     if "alternative_results" in data:
         for alt in data.get("alternative_results", []):
+            # Only include times from the requested day
+            if not alt.get("requested_day_result", False):
+                continue
             slots_data = alt.get("time_slots", [])
             if isinstance(slots_data, list) and slots_data:
                 if isinstance(slots_data[0], dict):
@@ -192,35 +213,51 @@ def format_restaurant_result(
     time_fmt = f"{time_str[:2]}:{time_str[2:]}"
 
     table = Table(title=f"Availability: {name}", show_lines=True)
+    table.add_column("Date", style="cyan")
     table.add_column("Area", style="dim")
     table.add_column("Status", style="bold")
     table.add_column("Slots", style="green")
 
     if "error" in data:
-        table.add_row("-", f"[red]Error: {data['error']}[/red]", "-")
+        table.add_row("-", "-", f"[red]Error: {data['error']}[/red]", "-")
     elif "alternative_results" in data:
         for alt in data.get("alternative_results", []):
+            # Get date from title_timestamp
+            title_ts = alt.get("title_timestamp", "")
+            if title_ts:
+                date_label = utc_to_israel_date(title_ts)
+                if alt.get("requested_day_result", False):
+                    date_label = f"[bold]{date_label}[/bold]*"
+            else:
+                date_label = "-"
+
             slots_data = alt.get("time_slots", [])
             if isinstance(slots_data, list) and slots_data:
                 if isinstance(slots_data[0], dict):
+                    first_area = True
                     for area in slots_data:
                         area_name = area.get("name", "unknown")
                         times = [utc_to_israel_time(t) for t in area.get("time_slots", [])[:8]]
                         if times:
-                            table.add_row(area_name, "[green]Available[/green]", ", ".join(times))
+                            # Only show date on first row for this date group
+                            row_date = date_label if first_area else ""
+                            table.add_row(row_date, area_name, "[green]Available[/green]", ", ".join(times))
+                            first_area = False
                         else:
-                            table.add_row(area_name, "[red]Full[/red]", "-")
+                            row_date = date_label if first_area else ""
+                            table.add_row(row_date, area_name, "[red]Full[/red]", "-")
+                            first_area = False
                 else:
                     times = [utc_to_israel_time(t) for t in slots_data[:8]]
-                    table.add_row("-", "[green]Available[/green]", ", ".join(times))
+                    table.add_row(date_label, "-", "[green]Available[/green]", ", ".join(times))
     elif "id" in data:
-        table.add_row("-", "[green]SLOT AVAILABLE[/green]", time_fmt)
+        table.add_row(date_fmt, "-", "[green]SLOT AVAILABLE[/green]", time_fmt)
     else:
         desc = data.get("description_string", str(data)[:80])
-        table.add_row("-", f"[yellow]{desc}[/yellow]", "-")
+        table.add_row("-", "-", f"[yellow]{desc}[/yellow]", "-")
 
     console.print(table)
-    console.print(f"[dim]Date: {date_fmt} | Time: {time_fmt} | Party: {party_size}[/dim]")
+    console.print(f"[dim]Requested: {date_fmt} at {time_fmt} for {party_size} people | * = requested date[/dim]")
 
 
 def format_batch_results(
