@@ -5,30 +5,47 @@ description: "Search Israeli restaurant availability. Triggers: restaurant reser
 
 # Israeli Restaurants Skill
 
-Search for restaurant availability using OnTopo and Tabit.
+Search for restaurant availability across OnTopo and Tabit booking platforms.
 
-## CRITICAL: Use the CLIs
+## Installation
 
-Located at: `~/projects/israeli-restaurants/`
+### Prerequisites
+- Python >= 3.12
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
+
+### Setup
+```bash
+git clone https://github.com/eytanlevit/israeli-restaurants.git
+cd israeli-restaurants
+uv sync
+```
+
+No API keys or environment variables required. The CLIs handle all API calls directly.
+
+### Add as a Claude Code skill
+```bash
+claude skill add --from /path/to/israeli-restaurants/SKILL.md
+```
 
 ## Commands
+
+Set `REPO` to wherever you cloned the repo (e.g., `~/projects/israeli-restaurants`).
 
 ### Search all restaurants (batch mode)
 ```bash
 # OnTopo restaurants
-uv run --script ~/projects/israeli-restaurants/ontopo-cli --batch -d YYYYMMDD -t HHMM -p PARTY
+uv run --script $REPO/ontopo-cli --batch -d YYYYMMDD -t HHMM -p PARTY
 
 # Tabit restaurants
-uv run --script ~/projects/israeli-restaurants/tabit-cli --batch -d YYYYMMDD -t HHMM -p PARTY
+uv run --script $REPO/tabit-cli --batch -d YYYYMMDD -t HHMM -p PARTY
 
 # For comprehensive search, run BOTH commands
 ```
 
 ### Search specific restaurant by name
 ```bash
-# If you know the provider:
-uv run --script ~/projects/israeli-restaurants/ontopo-cli -r "name_or_slug" -d YYYYMMDD -t HHMM -p PARTY
-uv run --script ~/projects/israeli-restaurants/tabit-cli -r "name_or_org_id" -d YYYYMMDD -t HHMM -p PARTY
+uv run --script $REPO/ontopo-cli -r "name_or_slug" -d YYYYMMDD -t HHMM -p PARTY
+uv run --script $REPO/tabit-cli -r "name_or_org_id" -d YYYYMMDD -t HHMM -p PARTY
 ```
 
 ## Date Format
