@@ -115,11 +115,11 @@ uv run --script $REPO/tabit-cli --list
 
 4. **If 10+ restaurants, group by cuisine:**
    ```
-   יפני:
+   🍣 יפני:
    • Gaijin Izakaya - 20:00-21:00
    • ASA Izakaya - 19:30, 20:15
 
-   איטלקי:
+   🍝 איטלקי:
    • Cicchetti - 20:00, 20:45
    • Romano - 19:30-20:15
    ```
