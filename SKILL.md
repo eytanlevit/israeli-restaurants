@@ -152,6 +152,26 @@ uv run --script $REPO/tabit-cli --list
 
 For general queries like "what's available tonight" or "מסעדה הערב", follow the same workflow -- always run BOTH CLIs to get complete coverage.
 
+## Booking Links (VERIFIED formats)
+
+When sharing a booking link with the user, use EXACTLY these formats.
+The batch output's "Book" column already uses them.
+
+**OnTopo** (slug = 8-digit ID from the CSV):
+```
+https://ontopo.com/he/il/page/{slug}
+```
+Example: https://ontopo.com/he/il/page/69127207 (Shila)
+⚠️ Do NOT use `ontopo.com/he/il/r/{slug}` — it redirects to a 404 page.
+
+**Tabit** (orgId = 24-char hex ID from the CSV):
+```
+https://tabitisrael.co.il/online-reservations/create-reservation?step=search&orgId={orgId}&locale=he-IL
+```
+Example: https://tabitisrael.co.il/online-reservations/create-reservation?step=search&orgId=64a2cd4dbaaf6d1b2ba2dfdc&locale=he-IL (Rova A)
+⚠️ Do NOT use `tabitisrael.co.il/he/rsv/area/{orgId}` or `/rsv/booking/create?orgId=` — both silently redirect to the Tabit homepage.
+⚠️ Tabit serves HTTP 200 for ANY path (SPA catch-all), so `curl` status checks cannot validate a Tabit link — only the format above is known to render the restaurant's booking page.
+
 ## Notes
 
 - The CSV contains the user's curated list of restaurants

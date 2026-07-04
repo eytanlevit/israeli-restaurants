@@ -278,12 +278,18 @@ def format_batch_results(
     table = Table(title="Restaurants with Availability", show_lines=True)
     table.add_column("Restaurant", style="cyan", no_wrap=True)
     table.add_column("Available Times", style="green")
-    table.add_column("Book", style="dim")
+    # overflow="fold" so full booking URLs are never ellipsis-truncated
+    table.add_column("Book", style="dim", overflow="fold")
 
     for r in available:
         name = r["name"]
         times_str = ", ".join(r["available_times"])
-        book_url = f"tabitisrael.co.il/he/rsv/area/{r['id']}"
+        # NOTE: /he/rsv/area/{id} and /rsv/booking/create?orgId= redirect to the homepage;
+        # online-reservations/create-reservation is the deep link restaurant sites use
+        book_url = (
+            "https://tabitisrael.co.il/online-reservations/create-reservation"
+            f"?step=search&orgId={r['id']}&locale=he-IL"
+        )
         table.add_row(name, times_str, book_url)
 
     console.print()
