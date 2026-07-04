@@ -10,15 +10,25 @@ Search for restaurant availability across OnTopo and Tabit booking platforms.
 ## Installation
 
 ### Prerequisites
-- Python >= 3.12
-- [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
+- Python >= 3.10 (with [uv](https://docs.astral.sh/uv/getting-started/installation/), none needed — uv provisions Python itself)
 
-### Setup
+### Setup — Option A: with uv (recommended)
 ```bash
 git clone https://github.com/eytanlevit/israeli-restaurants.git
-cd israeli-restaurants
-uv sync
 ```
+That's it. The CLIs declare their dependencies inline (PEP 723); `uv run --script` installs them automatically on first run. (`uv sync` is only needed to run the test suite.)
+
+### Setup — Option B: without uv (plain Python >= 3.10)
+```bash
+git clone https://github.com/eytanlevit/israeli-restaurants.git
+pip install httpx rich curl_cffi requests python-dotenv
+```
+Then run the CLIs with `python3` instead of `uv run --script`, e.g.:
+```bash
+python3 $REPO/ontopo-cli --batch -d YYYYMMDD -t HHMM -p PARTY
+```
+
+⚠️ **macOS system Python is 3.9.6 — too old.** `ontopo-cli` crashes on it (`X | None` annotations need 3.10+). On a fresh Mac, install uv (Option A) or Python 3.10+ from python.org first.
 
 No API keys or environment variables required. The CLIs handle all API calls directly.
 
